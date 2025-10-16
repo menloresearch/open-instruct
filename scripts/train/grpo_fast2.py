@@ -549,7 +549,7 @@ class ShufflingIterator:
 
 @ray.remote(num_gpus=1)
 class PolicyTrainerRayProcess(RayProcess):
-    def from_pretrained(self, args: Args, model_config: ModelConfig, wandb_url: str, tokenizer: PreTrainedTokenizer):
+    def from_pretrained(self, args: Args, model_config: ModelConfig, tokenizer: PreTrainedTokenizer):
         # ------------------------------------------------------------
         # Monkey patch to load checkpoints with `weights_only=False`
         # otherwise it errors out with:
@@ -569,7 +569,6 @@ class PolicyTrainerRayProcess(RayProcess):
         self.args = args
         self.tokenizer = tokenizer
         self.model_config = model_config
-        self.wandb_url = wandb_url
         torch.cuda.set_device(self.local_rank)
         self.device = torch.device(self.local_rank)
 
@@ -581,6 +580,7 @@ class PolicyTrainerRayProcess(RayProcess):
         random.seed(worker_seed)
 
         # @gau-nernst (TODO): migrate from DeepSpeed to FSDP2
+        # @gau-nernst (TODO): we don't need DeepSpeed for single GPU
         deepspeed.init_distributed(timeout=timedelta(minutes=args.backend_timeout))
 
         ds_config = get_train_ds_config(offload=False, adam_offload=False, stage=args.deepspeed_stage, bf16=True)
@@ -596,6 +596,8 @@ class PolicyTrainerRayProcess(RayProcess):
             dschf = None
         logger.info(f"Deepspeed config: {dschf=}")
 
+        # @gau-nernst (TODO): check torch_dtype here. training BF16 model is not right without extra tricks.
+        # @gau-nernst (TODO): check attn_implementation. F.sdpa w/ CuDNN backend should be faster.
         assert not model_config.use_peft
         self.policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
@@ -693,8 +695,6 @@ class PolicyTrainerRayProcess(RayProcess):
             dschf = None
         logger.info(f"DeepSpeed config: {dschf=}")
 
-        # @gau-nernst (TODO): check torch_dtype here. training BF16 model is not right without extra tricks.
-        # @gau-nernst (TODO): check attn_implementation. F.sdpa w/ CuDNN backend should be faster.
         self.ref_policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
             revision=model_config.model_revision,
@@ -1276,11 +1276,17 @@ class PolicyTrainerRayProcess(RayProcess):
 
 class ModelGroup:
     def __init__(
-        self, pg: PlacementGroup, ray_process_cls: RayProcess, num_gpus_per_node: list[int], single_gpu_mode: bool
+        self,
+        pg: PlacementGroup,
+        ray_process_cls: type[RayProcess],
+        num_gpus_per_node: list[int],
+        single_gpu_mode: bool,
     ):
         self.pg = pg
         self.ray_process_cls = ray_process_cls
         self.num_gpus_per_node = num_gpus_per_node
+        # 0.48 means that this Ray Actor is allocated 0.48 GPU
+        # -> another GPU Actor can be scheduled on the same 1-GPU node.
         self.num_gpus_per_actor = 0.48 if single_gpu_mode else 1
         self.num_cpus_per_actor = 4
         self.models = []
@@ -1315,6 +1321,8 @@ class ModelGroup:
         assert get_bundle_index(16, [7, 8, 4]) == 2
 
         # Setup worker models
+        # @gau-nernst (NOTE): this means this allows nodes with different no. of GPUs?
+        # which is a rather strange thing to support.
         for rank in range(1, world_size):
             logger.debug(f"{rank=}, {world_size=}, {rank=}, {master_addr=}, {master_port=}")
             scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -2037,26 +2045,6 @@ def setup_runtime_variables(args: Args) -> Args:
     return args
 
 
-def setup_experiment_tracking(args: Args, tc: TokenizerConfig, model_config: ModelConfig):
-    """Setup experiment tracking and seeds."""
-    all_configs = {}
-    all_configs.update(**asdict(args), **asdict(tc), **asdict(model_config))
-
-    wandb_url = None
-    if args.with_tracking:
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            config=all_configs,
-            name=args.run_name,
-            save_code=True,
-            tags=[args.exp_name] + get_wandb_tags(),
-        )
-        wandb_url = wandb.run.get_url()
-
-    return wandb_url
-
-
 def setup_datasets(args: Args, tc: TokenizerConfig, tokenizer: PreTrainedTokenizer):
     """Set up training and evaluation datasets."""
     transform_fn_args = [
@@ -2103,7 +2091,6 @@ def create_model_and_optimizer(
     args: Args,
     tc: TokenizerConfig,
     model_config: ModelConfig,
-    wandb_url: str,
     tokenizer: PreTrainedTokenizer,
     inference_results_Q: ray_queue.Queue,
     param_prompt_Q: ray_queue.Queue,
@@ -2115,13 +2102,13 @@ def create_model_and_optimizer(
     pg = placement_group(bundles, strategy="STRICT_SPREAD")
     ray_get_with_progress([pg.ready()], desc="Waiting for placement group")
     inits = []
+
+    # initialize policy model and reference model
     policy_group = ModelGroup(pg, PolicyTrainerRayProcess, args.num_learners_per_node, args.single_gpu_mode)
-    wandb_url = wandb.run.get_url() if args.with_tracking else None
-    inits.extend(
-        model.from_pretrained.remote(args, model_config, wandb_url, tokenizer) for model in policy_group.models
-    )
+    inits.extend(model.from_pretrained.remote(args, model_config, tokenizer) for model in policy_group.models)
 
     # Set up tools
+    # @gau-nernst (TODO): this can be refactored to easily add more tools
     max_len = args.max_prompt_token_length + args.response_length
     tool_objects = {}
     if args.tools:
@@ -2356,7 +2343,6 @@ def one_training_step(
     start_time,
     train_dataset,
     training_start_time,
-    wandb_url,
     chat_template_name,
     model_dims: utils.ModelDims,
     prompt_lengths: list[int],
@@ -2548,11 +2534,7 @@ def maybe_evaluate(
 
 
 def save_final_model(
-    args: Args,
-    policy_group: ModelGroup,
-    tokenizer: PreTrainedTokenizer,
-    training_step: int,
-    chat_template_name: str,
+    args: Args, policy_group: ModelGroup, tokenizer: PreTrainedTokenizer, training_step: int, chat_template_name: str
 ):
     """Save the final model and launch evaluation jobs if configured."""
     logger.info(f"Saving final model at step {training_step} to {args.output_dir}")
@@ -2733,7 +2715,6 @@ def run_training(
     reward_fn,
     resume_training_step,
     episode,
-    wandb_url,
     tc,
     stop_event,
     executor,
@@ -2870,7 +2851,6 @@ def run_training(
             start_time,
             train_dataset,
             training_start_time,
-            wandb_url,
             tc.chat_template_name,
             model_dims,
             prompt_lengths,
@@ -2937,7 +2917,16 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig):
         for handler in logging.getLogger().handlers:
             handler.setLevel(logging.DEBUG)
 
-    wandb_url = setup_experiment_tracking(args, tc, model_config)
+    if args.with_tracking:
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            config={**asdict(args), **asdict(tc), **asdict(model_config)},
+            name=args.run_name,
+            save_code=True,
+            tags=[args.exp_name] + get_wandb_tags(),
+            dir="wandb_logs",
+        )
 
     train_dataset, eval_dataset = setup_datasets(args, tc, tokenizer)
 
@@ -2965,14 +2954,7 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig):
 
     policy_group, vllm_engines, tool_objects, resume_training_step, episode, actor_manager = (
         create_model_and_optimizer(
-            args,
-            tc,
-            model_config,
-            wandb_url,
-            tokenizer,
-            inference_results_Q,
-            param_prompt_Q,
-            evaluation_inference_results_Q,
+            args, tc, model_config, tokenizer, inference_results_Q, param_prompt_Q, evaluation_inference_results_Q
         )
     )
 
@@ -3030,7 +3012,6 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig):
             reward_fn,
             resume_training_step,
             episode,
-            wandb_url,
             tc,
             stop_event,
             executor,

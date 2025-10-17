@@ -764,6 +764,8 @@ class PolicyTrainerRayProcess(RayProcess):
                 self.args.vllm_num_engines,
                 self.args.vllm_tensor_parallel_size,
             )
+            # initialize a new process group with all vLLM ranks + trainer rank0.
+            # where trainer rank0 is also rank0 of this openrlhf process group.
             world_size = vllm_num_engines * vllm_tensor_parallel_size + 1
             backend = self.args.vllm_sync_backend
             refs = [
@@ -795,37 +797,36 @@ class PolicyTrainerRayProcess(RayProcess):
         model = self.model.module
         count, num_params = 0, len(list(model.named_parameters()))
         refss = []
-        if self.args.gather_whole_model:
+
+        # in the trainer group, all-gather sharded weights (ZeRO-3).
+        # trainer-0 broadcasts full weights to vLLM ranks.
+        # @gau-nernst (NOTE): there is probably an "optimal" threshold of how many bytes to all-gather at a time
+        # to armotize overhead while avoiding fully materializing the model on a single GPU.
+
+        def update_param(name, param, count):
+            # ask vLLM ranks to wait for broadcast. calling RPC from trainer-0.
+            shape = param.shape if self.args.deepspeed_stage != 3 else param.ds_shape
+            refs = [
+                engine.update_weight.remote(
+                    name, dtype=param.dtype, shape=shape, empty_cache=count == num_params
+                )
+                for engine in self.vllm_engines
+            ]
+            refss.extend(refs)
+            dist.broadcast(param.data, 0, group=self.model_update_group)
+
+        if self.args.gather_whole_model:  # all-gather all parameters at once
             with deepspeed.zero.GatheredParameters(model.parameters(), enabled=self.args.deepspeed_stage == 3):
-                for name, param in model.named_parameters():
-                    count += 1  # empty_cache at last param
-                    # Fire all vllm engines for broadcast
-                    if dist.get_rank() == 0:
-                        shape = param.shape if self.args.deepspeed_stage != 3 else param.ds_shape
-                        refs = [
-                            engine.update_weight.remote(
-                                name, dtype=param.dtype, shape=shape, empty_cache=count == num_params
-                            )
-                            for engine in self.vllm_engines
-                        ]
-                        refss.extend(refs)
-                    if dist.get_rank() == 0:
-                        dist.broadcast(param.data, 0, group=self.model_update_group)
-        else:  # broadcast each parameter independently
+                if dist.get_rank() == 0:
+                    for name, param in model.named_parameters():
+                        count += 1  # empty_cache at last param
+                        update_param(name, param, count)
+        else:  # all-gather one parameter at a time
             for name, param in model.named_parameters():
                 count += 1
-                if dist.get_rank() == 0:
-                    shape = param.shape if self.args.deepspeed_stage != 3 else param.ds_shape
-                    refs = [
-                        engine.update_weight.remote(
-                            name, dtype=param.dtype, shape=shape, empty_cache=count == num_params
-                        )
-                        for engine in self.vllm_engines
-                    ]
-                    refss.extend(refs)
                 with deepspeed.zero.GatheredParameters([param], enabled=self.args.deepspeed_stage == 3):
                     if dist.get_rank() == 0:
-                        dist.broadcast(param.data, 0, group=self.model_update_group)
+                        update_param(name, param, count)
 
         # Return futures instead of blocking - let caller handle completion
         all_refs = []

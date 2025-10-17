@@ -2565,6 +2565,9 @@ def make_tokenizer(tc: TokenizerConfig, model_config: ModelConfig):
 
 def make_reward_fn(args: Args) -> Callable:
     """Create a reward function based on the provided arguments."""
+    # @gau-nernst (NOTE): this will create a mapping of dataset-2-verifier_fn
+    # later, apply_verifiable_reward() will select the reward function based on
+    # the 'dataset' columns.
     reward_fn_mapping = build_all_verifiers(args)
 
     async def reward_fn(

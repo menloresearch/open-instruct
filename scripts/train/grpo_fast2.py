@@ -807,9 +807,7 @@ class PolicyTrainerRayProcess(RayProcess):
             # ask vLLM ranks to wait for broadcast. calling RPC from trainer-0.
             shape = param.shape if self.args.deepspeed_stage != 3 else param.ds_shape
             refs = [
-                engine.update_weight.remote(
-                    name, dtype=param.dtype, shape=shape, empty_cache=count == num_params
-                )
+                engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
                 for engine in self.vllm_engines
             ]
             refss.extend(refs)
@@ -835,6 +833,9 @@ class PolicyTrainerRayProcess(RayProcess):
         return all_refs
 
     def update_ref_policy(self):
+        # @gau-nernst (NOTE): why do we need to all-gather the weights here? if policy and reference models
+        # use the same sharding, we can do EMA directly on sharded weights.
+        # @gau-nernst (NOTE): mul_() and add_() can be replaced with .lerp_() -> more accurate if BF16 is used.
         for ref_param, param in zip(self.ref_policy.parameters(), self.model.parameters()):
             if self.args.deepspeed_stage == 3:
                 with deepspeed.zero.GatheredParameters([param, ref_param], modifier_rank=0):
@@ -1500,7 +1501,6 @@ def accumulate_inference_batches(
     training_step: int,
     generation_config: vllm.SamplingParams,
     num_prompts: int,
-    model_dims: utils.ModelDims,
     actor_manager=None,
     timeout: float | None = None,
 ) -> tuple[GenerationResult, Batch]:
@@ -1655,7 +1655,6 @@ def data_preparation_thread(
     generation_config,
     resume_training_step: int,
     actor_manager=None,
-    model_dims: utils.ModelDims = None,
 ):
     for training_step in range(resume_training_step, num_training_steps + 1):
         # Streaming accumulation: collect results as they arrive
@@ -1667,7 +1666,6 @@ def data_preparation_thread(
                 training_step,
                 generation_config,
                 num_prompts=args.num_unique_prompts_rollout,
-                model_dims=model_dims,
                 actor_manager=actor_manager,
             )
             if isinstance(result, ShutdownSentinel):
@@ -2451,7 +2449,6 @@ def maybe_evaluate(
     eval_generation_config,
     generate_metrics_Q: Queue,
     num_eval_prompts: int,
-    model_dims: utils.ModelDims,
     actor_manager=None,
 ):
     """Optionally evaluate the model."""
@@ -2468,7 +2465,6 @@ def maybe_evaluate(
             training_step,
             eval_generation_config,
             num_prompts=num_eval_prompts,
-            model_dims=model_dims,
             actor_manager=actor_manager,
             timeout=timeout,
         )
@@ -2716,17 +2712,17 @@ def run_training(
     reward_fn,
     resume_training_step,
     episode,
-    tc,
-    stop_event,
-    executor,
-    inference_results_Q,
-    param_prompt_Q,
-    evaluation_inference_results_Q,
-    packed_sequences_Q,
-    pending_queries_map,
-    eval_pending_queries_map,
-    generate_metrics_Q,
-    weight_sync_metrics_Q,
+    tc: TokenizerConfig,
+    stop_event: threading.Event,
+    executor: futures.ThreadPoolExecutor,
+    inference_results_Q: ray_queue.Queue,
+    param_prompt_Q: ray_queue.Queue,
+    evaluation_inference_results_Q: ray_queue.Queue,
+    packed_sequences_Q: Queue,
+    pending_queries_map: PendingQueriesMap,
+    eval_pending_queries_map: PendingQueriesMap,
+    generate_metrics_Q: Queue,
+    weight_sync_metrics_Q: Queue,
     actor_manager: ActorManager,
     model_dims: utils.ModelDims,
     checkpoint_state=None,
@@ -2765,7 +2761,6 @@ def run_training(
         generation_configs["train"],
         resume_training_step,
         actor_manager,
-        model_dims,
     )
 
     def health_check_fn():
@@ -2899,7 +2894,6 @@ def run_training(
             generation_configs["eval"],
             generate_metrics_Q,
             len(eval_batch.queries) if eval_batch else 0,
-            model_dims,
             actor_manager,
         )
 

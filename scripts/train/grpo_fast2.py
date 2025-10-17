@@ -27,40 +27,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# isort: off
-import os
-from concurrent import futures
 
-# We need to set NCCL_CUMEM_ENABLE=0 for performance reasons; see:
-# https://github.com/vllm-project/vllm/issues/5723#issuecomment-2554389656
-os.environ["NCCL_CUMEM_ENABLE"] = "0"  # NOQA
-try:
-    import deepspeed
-
-    # @vwxyzjn: when importing on CPU-only machines, we get the following error:
-    # RuntimeError: 0 active drivers ([]). There should only be one.
-    # so we need to catch the exception and do nothing
-    # https://github.com/deepspeedai/DeepSpeed/issues/7028
-except Exception:
-    pass
-
-from open_instruct import utils
-
-# isort: on
 import asyncio
 import json
 import logging
 import math
+import os
 import random
 import socket
 import threading
 import time
 from argparse import Namespace
 from collections import defaultdict
+from concurrent import futures
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Iterator, Literal
+
+# We need to set NCCL_CUMEM_ENABLE=0 for performance reasons; see:
+# https://github.com/vllm-project/vllm/issues/5723#issuecomment-2554389656
+os.environ["NCCL_CUMEM_ENABLE"] = "0"  # NOQA
 
 import datasets
 import numpy as np
@@ -81,7 +68,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, PreTrainedModel, PreTrainedTokenizer, get_scheduler
 from transformers.integrations import HfDeepSpeedConfig
 
-from open_instruct import logger_utils, vllm_utils3
+from open_instruct import logger_utils, utils, vllm_utils3
 from open_instruct.actor_manager import ActorManager
 from open_instruct.dataset_transformation import (
     GROUND_TRUTHS_KEY,
@@ -554,6 +541,7 @@ class PolicyTrainerRayProcess(RayProcess):
         # Monkey patch to load checkpoints with `weights_only=False`
         # otherwise it errors out with:
         # `_pickle.UnpicklingError: Weights only load failed. ` with pytorch 2.6.0
+        import deepspeed
         from deepspeed.runtime.checkpoint_engine import torch_checkpoint_engine
         from deepspeed.utils import logger
 
@@ -792,6 +780,8 @@ class PolicyTrainerRayProcess(RayProcess):
         dist.barrier()
 
     def broadcast_to_vllm(self):
+        import deepspeed
+
         # avoid OOM
         torch.cuda.empty_cache()
         model = self.model.module
@@ -833,6 +823,8 @@ class PolicyTrainerRayProcess(RayProcess):
         return all_refs
 
     def update_ref_policy(self):
+        import deepspeed
+
         # @gau-nernst (NOTE): why do we need to all-gather the weights here? if policy and reference models
         # use the same sharding, we can do EMA directly on sharded weights.
         # @gau-nernst (NOTE): mul_() and add_() can be replaced with .lerp_() -> more accurate if BF16 is used.
@@ -1218,6 +1210,8 @@ class PolicyTrainerRayProcess(RayProcess):
                 )
 
     def save_model(self, output_dir: str, chat_template_name: str, tokenizer: PreTrainedTokenizer) -> None:
+        import deepspeed
+
         model_to_save = self.model
         if chat_template_name is not None and "olmo" in chat_template_name:
             # New chat template has no bos token, and two eos tokens: <|im_end|> and <|endoftext|>

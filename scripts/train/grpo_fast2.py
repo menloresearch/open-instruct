@@ -2101,7 +2101,8 @@ def create_model_and_optimizer(
     inits.extend(model.from_pretrained.remote(args, model_config, tokenizer) for model in policy_group.models)
 
     # Set up tools
-    # @gau-nernst (TODO): this can be refactored to easily add more tools
+    # @gau-nernst (TODO): this can be refactored to easily add more tools.
+    # @gau-nernst (NOTE): vLLM rollout will stop when it encounters ending token of the tools.
     max_len = args.max_prompt_token_length + args.response_length
     tool_objects = {}
     if args.tools:

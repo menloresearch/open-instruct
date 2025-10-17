@@ -30,7 +30,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ray
 import torch
-import torch.distributed
 import vllm
 from ray.util import queue as ray_queue
 from ray.util.placement_group import placement_group
@@ -161,7 +160,14 @@ def get_triggered_tool(
     return None, None
 
 
-def _handle_output(output, tools, tracking, sampling_params, max_tool_calls, executor):
+def _handle_output(
+    output: vllm.RequestOutput,
+    tools: dict[str, Tool],
+    tracking: dict,
+    sampling_params: vllm.SamplingParams,
+    max_tool_calls: dict[str, int],
+    executor: futures.Executor,
+):
     """
     Handle a finished output. Returns the output if it should be added to results,
     or None if it's being held for tool processing.

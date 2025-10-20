@@ -1471,7 +1471,7 @@ def calculate_utilization_metrics(
     total_training_device_flops = model_dims.device_flops * num_training_gpus
     learner_mfu = 100 * training_flops_per_second / total_training_device_flops
 
-    return {"actor_mfu": actor_mfu, "actor_mbu": actor_mbu, "learner_mfu": learner_mfu}
+    return {"perf/actor_mfu": actor_mfu, "perf/actor_mbu": actor_mbu, "perf/learner_mfu": learner_mfu}
 
 
 def accumulate_inference_batches(
@@ -2412,8 +2412,8 @@ def one_training_step(
         "val/num_total_tokens": num_total_tokens,
         "val/num_step_tokens": num_step_tokens,
         "epoch": episode / args.num_samples_per_prompt_rollout / len(train_dataset),
-        "learner_tokens_per_second_overall": num_total_tokens / total_training_time,
-        "learner_tokens_per_second_step": num_step_tokens / step_time,
+        "perf/learner_tokens_per_second_overall": num_total_tokens / total_training_time,
+        "perf/learner_tokens_per_second_step": num_step_tokens / step_time,
         "time/total": step_time,
         "time/training": train_timer.duration,
         "time/saving": save_time,

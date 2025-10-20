@@ -1723,10 +1723,11 @@ def data_preparation_thread(
             # Log zero-gradient filtering statistics
             num_zero_std_prompts = (~non_zero_std_mask).sum()
             num_filtered_responses = len(scores) - len(non_zero_gradient_index)
+            retention_rate = len(non_zero_gradient_index) / len(scores)
             if num_filtered_responses > 0:
                 logger.info(
                     f"[Zero-gradient filtering] Filtered {num_zero_std_prompts} prompts with zero std "
-                    f"({num_filtered_responses} responses). Retention rate: {len(non_zero_gradient_index) / len(scores):.2%}"
+                    f"({num_filtered_responses} responses). Retention rate: {retention_rate:.2%}"
                 )
 
             advantages = advantages[non_zero_gradient_index]
@@ -1946,9 +1947,10 @@ def data_preparation_thread(
                 "scores": np.array(scores).mean(),
                 "real_batch_size_ratio": real_batch_size_ratio,
                 "unsolved_batch_size_ratio": unsolved_batch_size_ratio,
-                "num_responses": len(responses),
-                "num_packed_sequences": len(packed_sequences.query_responses),
-                "packed_ratio": len(packed_sequences.query_responses) / len(responses) if len(responses) > 0 else 0,
+                "data/retention_rate": retention_rate,
+                "data/num_responses": len(responses),
+                "data/num_packed_sequences": len(packed_sequences.query_responses),
+                "data/packed_ratio": len(packed_sequences.query_responses) / len(responses) if len(responses) > 0 else 0,
                 "val/all_zero_reward_groups": all_zero_groups,
                 "val/all_zero_reward_groups_ratio": all_zero_groups_ratio,
                 "val/total_reward_groups": total_groups,

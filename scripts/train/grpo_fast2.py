@@ -1809,6 +1809,12 @@ def data_preparation_thread(
                 f"({all_zero_groups / total_groups:.1%})"
             )
 
+        # @gau-nernst (NOTE):
+        # - given a list of (query+response), pack them to another list so that each item contains multiple
+        #   sequences, sum up no more than pack_length.
+        # - this may have strange interactions in distributed setting according to the logic below.
+        # - if the number of packed sequences does not divide by WORLD_SIZE, if allow_world_padding=True,
+        #   it will add dummy data (which maybe fine). otherwise, it will drop some packed sequences.
         with Timer("📦 [Data Preparation Thread] Packing sequences"):
             packed_sequences = pack_sequences(
                 queries=batch.queries,
@@ -1869,6 +1875,11 @@ def data_preparation_thread(
                 per_device_packed_vllm_logprobs = packed_sequences.vllm_logprobs[B * i : B * (i + 1)]
 
                 # Shuffle the batch and collate the data
+                # @gau-nernst (NOTE)
+                # - shuffle the data for each rank, then shard it into per_device_train_batch_size.
+                # - if packing is enabled (which is always on), per_device_train_batch_size is unnecessary.
+                # - is permuting the packed sequences here necessary? should just shuffle BEFORE splitting
+                #   into WORLD_SIZE, or shuffle BEFORE packing.
                 b_inds = np.random.permutation(len(per_device_packed_query_responses))
                 collated_query_responses = []
                 collated_tool_masks = []
@@ -1935,6 +1946,8 @@ def data_preparation_thread(
                 "scores": np.array(scores).mean(),
                 "real_batch_size_ratio": real_batch_size_ratio,
                 "unsolved_batch_size_ratio": unsolved_batch_size_ratio,
+                "num_responses": len(responses),
+                "num_packed_sequences": len(packed_sequences.query_responses),
                 "packed_ratio": len(packed_sequences.query_responses) / len(responses) if len(responses) > 0 else 0,
                 "val/all_zero_reward_groups": all_zero_groups,
                 "val/all_zero_reward_groups_ratio": all_zero_groups_ratio,

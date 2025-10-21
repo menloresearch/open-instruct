@@ -807,7 +807,7 @@ class PolicyTrainerRayProcess(RayProcess):
             # ask vLLM ranks to wait for broadcast. calling RPC from trainer-0.
             shape = param.shape if self.args.deepspeed_stage != 3 else param.ds_shape
             refs = [
-                engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
+                engine.update_weight.remote(name, dtype=str(param.dtype), shape=shape, empty_cache=count == num_params)
                 for engine in self.vllm_engines
             ]
             refss.extend(refs)
